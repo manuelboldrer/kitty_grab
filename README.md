@@ -108,6 +108,15 @@ It will take effect the next time you use the grabber.
 Vim-like modal selecting is available.
 Copy the provided `grab-vim.conf.example` file, and copy it to `~/.config/kitty/grab.conf`.
 
+It provides `hjkl` movement, `v`/`V`/`Ctrl+v` to enter character-wise,
+line-wise and block-wise visual selection, and familiar word motions:
+`w`/`W`, `b`/`B` and `e`/`E` to move by word/WORD, `f`/`t`/`F`/`T` to jump
+to a character on the current line (`;`/`,` repeat that jump forward/
+backward), `H`/`M`/`L` to jump to the top/middle/bottom of the screen,
+`%` to jump to a matching bracket, `/`/`?` to search the whole buffer
+(`n`/`N` repeat the search forward/backward), and `yy`/`Y` to yank the
+current line (or the active selection, if any).
+
 
 # License
 

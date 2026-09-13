@@ -20,9 +20,12 @@
 #: Exit the grabber without copying anything.
 
 # map Enter confirm
-map y confirm
+map y yank
+map Y yank_line
 
 #: Copy the selected region to clipboard and exit.
+#: Press y twice (yy), or Y, to yank the current line.
+#: Press y once while a selection is active to yank the selection.
 
 map h           move left
 map l           move right
@@ -36,12 +39,50 @@ map $           move last nonwhite
 map g           move top
 map G           move bottom
 map b           move word left
+map B           move big_word left
 map w           move word right
+map W           move big_word right
+map e           move word end
+map E           move big_word end
 
 #: Move the cursor around the screen.
 #: This will scroll the buffer if needed and possible.
 #: Note that due to https://github.com/kovidgoyal/kitty/issues/5469, the ctrl+d
 #: shortcut will only work with kitty >= 0.26.2
+#: w/W move to the next word/WORD, b/B move to the previous word/WORD,
+#: and e/E move to the end of the current or next word/WORD.
+#: A "word" is a run of letters/digits/word-characters or a run of other
+#: punctuation; a "WORD" is any run of non-blank characters.
+
+map f find forward to
+map F find backward to
+map t find forward till
+map T find backward till
+map ;           repeat_find same
+map ,           repeat_find reverse
+
+#: Jump the cursor within the current line to the next (f/t) or previous
+#: (F/T) occurrence of the character typed right after the shortcut.
+#: f/F land on the character itself, t/T land just before/after it.
+#: ; repeats the last f/t/F/T, , repeats it in the opposite direction.
+
+map H move screen top
+map M move screen middle
+map L move screen bottom
+map %           move matching bracket
+
+#: H/M/L jump to the top/middle/bottom of the visible screen.
+#: % jumps to the bracket ( [ { or ) ] } matching the one
+#: at or after the cursor on the current line.
+
+map / start_search forward
+map ? start_search backward
+map n           repeat_search same
+map N           repeat_search reverse
+
+#: Type text after / or ? and press Enter to jump to the next/previous
+#: occurrence anywhere in the buffer (search wraps around); Escape cancels.
+#: n repeats the last search, N repeats it in the opposite direction.
 
 map Ctrl+y scroll up
 map Ctrl+e scroll down
@@ -50,10 +91,12 @@ map Ctrl+e scroll down
 #: Cursor stays in the same position relative to the screen.
 
 map v                 set_mode visual
+map V                 set_mode line
 map Ctrl+v            set_mode block
 map Ctrl+Left_Bracket set_mode normal
 map Escape            set_mode normal
 
 #: Change the selecting mode.
+#: V selects whole lines, like Vim's line-wise visual mode.
 
 #: }}}

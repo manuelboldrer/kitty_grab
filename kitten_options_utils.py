@@ -33,7 +33,10 @@ def parse_direction(direction: str) -> str:
                             'first', 'first nonwhite',
                             'last nonwhite', 'last',
                             'top', 'bottom',
-                            'word left', 'word right']
+                            'word left', 'word right', 'word end',
+                            'big word left', 'big word right', 'big word end',
+                            'screen top', 'screen middle', 'screen bottom',
+                            'matching bracket']
     return direction_lc.replace(' ', '_')
 
 
@@ -45,7 +48,26 @@ def parse_scroll_direction(direction: str) -> str:
 
 def parse_mode(mode: str) -> str:
     result = mode.lower()
-    assert result in ['normal', 'visual', 'block']
+    assert result in ['normal', 'visual', 'block', 'line']
+    return result
+
+
+def parse_find_args(args: str) -> Tuple[str, str]:
+    direction, kind = args.lower().split(' ', 1)
+    assert direction in ['forward', 'backward']
+    assert kind in ['to', 'till']
+    return direction, kind
+
+
+def parse_repeat_direction(direction: str) -> str:
+    result = direction.lower()
+    assert result in ['same', 'reverse']
+    return result
+
+
+def parse_search_direction(direction: str) -> str:
+    result = direction.lower()
+    assert result in ['forward', 'backward']
     return result
 
 
@@ -69,3 +91,23 @@ def select(func: Callable, args: str) -> Tuple[Callable, Tuple[str, str]]:
 @func_with_args("set_mode")
 def set_mode(func: Callable, mode: str) -> Tuple[Callable, str]:
     return func, parse_mode(mode)
+
+
+@func_with_args('find')
+def find(func: Callable, args: str) -> Tuple[Callable, Tuple[str, str]]:
+    return func, parse_find_args(args)
+
+
+@func_with_args('repeat_find')
+def repeat_find(func: Callable, direction: str) -> Tuple[Callable, str]:
+    return func, parse_repeat_direction(direction)
+
+
+@func_with_args('start_search')
+def start_search(func: Callable, direction: str) -> Tuple[Callable, str]:
+    return func, parse_search_direction(direction)
+
+
+@func_with_args('repeat_search')
+def repeat_search(func: Callable, direction: str) -> Tuple[Callable, str]:
+    return func, parse_repeat_direction(direction)

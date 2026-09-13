@@ -341,6 +341,29 @@ class ColumnarRegion(MarkedRegion):
             return _span(old_point.line, point.line) - {point.line}
 
 
+class LineRegion(MarkedRegion):
+    name = 'line'
+
+    @staticmethod
+    def line_inside_region(current_line: AbsoluteLine,
+                           start: Position, end: Position) -> bool:
+        return start.line <= current_line <= end.line
+
+    @staticmethod
+    def selection_in_line(
+            current_line: AbsoluteLine, start: Position, end: Position,
+            maxx: ScreenColumn) -> SelectionInLine:
+        if LineRegion.line_outside_region(current_line, start, end):
+            return None, None
+        return 0, maxx
+
+    @staticmethod
+    def lines_affected(mark: Optional[Position], old_point: Position,
+                       point: Position) -> Set[AbsoluteLine]:
+        assert mark is not None
+        return _span(mark.line, old_point.line, point.line)
+
+
 ActionName = str
 ActionArgs = tuple
 ShortcutMods = int
@@ -405,6 +428,11 @@ class GrabHandler(Handler):
         self.mark_type = NoRegion  # type: Type[Region]
         self.mode = 'normal'       # type: ModeTypeStr
         self.result = None         # type: Optional[ResultDict]
+        self._pending_find = None  # type: Optional[Tuple[bool, bool]]
+        self._pending_yank = False
+        self._last_find = None     # type: Optional[Tuple[str, bool, bool]]
+        self._pending_search = None  # type: Optional[Tuple[bool, str]]
+        self._last_search = None   # type: Optional[Tuple[bool, str]]
 
         # Operating System Command (OSC); command number 52
         # c — clipboard
@@ -482,10 +510,34 @@ class GrabHandler(Handler):
         return False
 
     def on_key_event(self, key_event: KeyEvent, in_bracketed_paste: bool = False) -> None:
-        action = self.shortcut_action(key_event)
-        if (key_event.type not in [kk.PRESS, kk.REPEAT]
-                or action is None):
+        if key_event.type not in [kk.PRESS, kk.REPEAT]:
             return
+        if self._pending_find is not None:
+            forward, till = self._pending_find
+            self._pending_find = None
+            if key_event.key != 'ESCAPE' and key_event.text:
+                self._do_find(key_event.text, forward, till)
+            return
+        if self._pending_search is not None:
+            forward, query = self._pending_search
+            if key_event.key == 'ESCAPE':
+                self._pending_search = None
+                self._update()
+            elif key_event.key == 'ENTER':
+                self._commit_search()
+            elif key_event.key == 'BACKSPACE':
+                self._pending_search = (forward, query[:-1]) if query else None
+                (self._update_search_prompt() if self._pending_search
+                 else self._update())
+            elif key_event.text:
+                self._pending_search = (forward, query + key_event.text)
+                self._update_search_prompt()
+            return
+        action = self.shortcut_action(key_event)
+        if action is None:
+            return
+        if self._pending_yank and action[0] != 'yank':
+            self._pending_yank = False
         self.perform_action(action)
 
     def perform_action(self, action: Tuple[ActionName, ActionArgs]) -> None:
@@ -502,6 +554,7 @@ class GrabHandler(Handler):
     mode_types = {'normal': NoRegion,
                   'visual': StreamRegion,
                   'block': ColumnarRegion,
+                  'line': LineRegion,
                   }  # type: Dict[ModeTypeStr, Type[Region]]
 
     def _ensure_mark(self, mark_type: Type[Region] = StreamRegion) -> None:
@@ -579,6 +632,64 @@ class GrabHandler(Handler):
                 self.screen_size.rows - 1)
         return Position(x, y, len(self.lines) - y)
 
+    def _screen_bottom_y(self) -> ScreenLine:
+        return min(self.screen_size.rows - 1,
+                  len(self.lines) - self.point.top_line)
+
+    def screen_top(self) -> Position:
+        return Position(self.point.x, 0, self.point.top_line)
+
+    def screen_middle(self) -> Position:
+        return Position(self.point.x, self._screen_bottom_y() // 2,
+                        self.point.top_line)
+
+    def screen_bottom(self) -> Position:
+        return Position(self.point.x, self._screen_bottom_y(),
+                        self.point.top_line)
+
+    def _position_for_line(self, line_no: AbsoluteLine,
+                           col: int) -> Position:
+        line = unstyled(self.lines[line_no - 1])
+        x = wcswidth(line[:col])
+        rows = self.screen_size.rows
+        top_line = self.point.top_line
+        if line_no < top_line:
+            top_line = line_no
+        elif line_no >= top_line + rows:
+            top_line = line_no - rows + 1
+        return Position(x, line_no - top_line, top_line)
+
+    def matching_bracket(self) -> Position:
+        pairs = {'(': (')', 1), '[': (']', 1), '{': ('}', 1),
+                ')': ('(', -1), ']': ('[', -1), '}': ('{', -1)}
+        line_no = self.point.line
+        line = unstyled(self.lines[line_no - 1])
+        col = truncate_point_for_length(line, self.point.x)
+        while col < len(line) and line[col] not in pairs:
+            col += 1
+        if col >= len(line):
+            return self.point
+        char = line[col]
+        target, direction = pairs[char]
+        depth = 1
+        while True:
+            col += direction
+            if not (0 <= col < len(line)):
+                line_no += direction
+                if line_no < 1 or line_no > len(self.lines):
+                    return self.point
+                line = unstyled(self.lines[line_no - 1])
+                col = 0 if direction > 0 else len(line) - 1
+                if not (0 <= col < len(line)):
+                    continue
+            c = line[col]
+            if c == char:
+                depth += 1
+            elif c == target:
+                depth -= 1
+                if depth == 0:
+                    return self._position_for_line(line_no, col)
+
     def noop(self) -> Position:
         return self.point
 
@@ -596,12 +707,18 @@ class GrabHandler(Handler):
         return (unicodedata.category(c)[0] not in 'LN'
                 and c not in self._select_by_word_characters)
 
-    def word_left(self) -> Position:
+    def _class_pred(self, c: str, big: bool) -> Callable[[str], bool]:
+        if big:
+            return ((lambda ch: not ch.isspace()) if not c.isspace()
+                    else (lambda ch: ch.isspace()))
+        return (self._is_word_char if self._is_word_char(c)
+                else self._is_word_separator)
+
+    def _word_left(self, big: bool = False) -> Position:
         if self.point.x > 0:
             line = unstyled(self.lines[self.point.line - 1])
             pos = truncate_point_for_length(line, self.point.x)
-            pred = (self._is_word_char if self._is_word_char(line[pos - 1])
-                    else self._is_word_separator)
+            pred = self._class_pred(line[pos - 1], big)
             new_pos = pos - len(''.join(takewhile(pred, reversed(line[:pos]))))
             return Position(wcswidth(line[:new_pos]),
                             self.point.y, self.point.top_line)
@@ -613,12 +730,11 @@ class GrabHandler(Handler):
                             self.point.y, self.point.top_line - 1)
         return self.point
 
-    def word_right(self) -> Position:
+    def _word_right(self, big: bool = False) -> Position:
         line = unstyled(self.lines[self.point.line - 1])
         pos = truncate_point_for_length(line, self.point.x)
         if pos < len(line):
-            pred = (self._is_word_char if self._is_word_char(line[pos])
-                    else self._is_word_separator)
+            pred = self._class_pred(line[pos], big)
             new_pos = pos + len(''.join(takewhile(pred, line[pos:])))
             return Position(wcswidth(line[:new_pos]),
                             self.point.y, self.point.top_line)
@@ -628,16 +744,169 @@ class GrabHandler(Handler):
             return Position(0, self.point.y, self.point.top_line + 1)
         return self.point
 
-    def _select(self, direction: DirectionStr,
-                mark_type: Type[Region]) -> None:
+    def _word_end(self, big: bool = False) -> Position:
+        line = unstyled(self.lines[self.point.line - 1])
+        pos = truncate_point_for_length(line, self.point.x)
+        n = len(line)
+        i = pos + 1
+        while i < n and line[i].isspace():
+            i += 1
+        if i >= n:
+            if self.point.y < self.screen_size.rows - 1:
+                return Position(0, self.point.y + 1, self.point.top_line)
+            if self.point.top_line + self.point.y < len(self.lines):
+                return Position(0, self.point.y, self.point.top_line + 1)
+            return self.point
+        pred = self._class_pred(line[i], big)
+        while i + 1 < n and not line[i + 1].isspace() and pred(line[i + 1]):
+            i += 1
+        return Position(wcswidth(line[:i + 1]), self.point.y, self.point.top_line)
+
+    def word_left(self) -> Position:
+        return self._word_left()
+
+    def word_right(self) -> Position:
+        return self._word_right()
+
+    def word_end(self) -> Position:
+        return self._word_end()
+
+    def big_word_left(self) -> Position:
+        return self._word_left(big=True)
+
+    def big_word_right(self) -> Position:
+        return self._word_right(big=True)
+
+    def big_word_end(self) -> Position:
+        return self._word_end(big=True)
+
+    def _find_char_position(self, char: str, forward: bool, till: bool,
+                            extra_skip: int = 0) -> Position:
+        line = unstyled(self.lines[self.point.line - 1])
+        pos = truncate_point_for_length(line, self.point.x)
+        if forward:
+            idx = line.find(char, pos + 1 + extra_skip)
+            if idx == -1:
+                return self.point
+            target = idx - 1 if till else idx
+        else:
+            search_end = pos - 1 - extra_skip
+            if search_end < 0:
+                return self.point
+            idx = line.rfind(char, 0, search_end + 1)
+            if idx == -1:
+                return self.point
+            target = idx + 1 if till else idx
+        return Position(wcswidth(line[:target]), self.point.y, self.point.top_line)
+
+    def find(self, direction: str, kind: str) -> None:
+        self._pending_find = (direction == 'forward', kind == 'till')
+
+    def _do_find(self, char: str, forward: bool, till: bool,
+                extra_skip: int = 0) -> None:
+        self._last_find = (char, forward, till)
+        self._move_to(self._find_char_position(char, forward, till, extra_skip),
+                      self.mode_types[self.mode])
+
+    def repeat_find(self, direction: str) -> None:
+        if self._last_find is None:
+            return
+        char, forward, till = self._last_find
+        same = direction == 'same'
+        extra_skip = 1 if (till and same) else 0
+        self._do_find(char, forward if same else not forward, till, extra_skip)
+
+    def _search_position(self, forward: bool, query: str) -> Optional[Position]:
+        n = len(self.lines)
+        cur_line_no = self.point.line
+        cur_line = unstyled(self.lines[cur_line_no - 1])
+        col = truncate_point_for_length(cur_line, self.point.x)
+        if forward:
+            idx = cur_line.find(query, col + 1)
+            if idx != -1:
+                return self._position_for_line(cur_line_no, idx)
+            for offset in range(1, n):
+                line_no = (cur_line_no - 1 + offset) % n + 1
+                line = unstyled(self.lines[line_no - 1])
+                idx = line.find(query)
+                if idx != -1:
+                    return self._position_for_line(line_no, idx)
+            idx = cur_line.find(query)
+            return (self._position_for_line(cur_line_no, idx)
+                    if idx not in (-1, col) else None)
+        else:
+            idx = cur_line.rfind(query, 0, col) if col > 0 else -1
+            if idx != -1:
+                return self._position_for_line(cur_line_no, idx)
+            for offset in range(1, n):
+                line_no = (cur_line_no - 1 - offset) % n + 1
+                line = unstyled(self.lines[line_no - 1])
+                idx = line.rfind(query)
+                if idx != -1:
+                    return self._position_for_line(line_no, idx)
+            idx = cur_line.rfind(query)
+            return (self._position_for_line(cur_line_no, idx)
+                    if idx not in (-1, col) else None)
+
+    def start_search(self, direction: str) -> None:
+        self._pending_search = (direction == 'forward', '')
+
+    def _update_search_prompt(self) -> None:
+        if self._pending_search is None:
+            return
+        forward, query = self._pending_search
+        prefix = '/' if forward else '?'
+        self.cmd.set_window_title('Grab – {}{}'.format(prefix, query))
+
+    def _do_search(self, forward: bool, query: str) -> None:
+        pos = self._search_position(forward, query)
+        if pos is not None:
+            self._move_to(pos, self.mode_types[self.mode])
+        else:
+            self._update()
+
+    def _commit_search(self) -> None:
+        forward, query = self._pending_search
+        self._pending_search = None
+        if query:
+            self._last_search = (forward, query)
+            self._do_search(forward, query)
+        else:
+            self._update()
+
+    def repeat_search(self, direction: str) -> None:
+        if self._last_search is None:
+            return
+        forward, query = self._last_search
+        self._do_search(forward if direction == 'same' else not forward, query)
+
+    def yank(self) -> None:
+        if self.mark is not None:
+            self.confirm()
+            return
+        if self._pending_yank:
+            self._pending_yank = False
+            self.yank_line()
+            return
+        self._pending_yank = True
+
+    def yank_line(self) -> None:
+        self.result = {'copy': unstyled(self.lines[self.point.line - 1])}
+        self.quit_loop(0)
+
+    def _move_to(self, new_point: Position, mark_type: Type[Region]) -> None:
         self._ensure_mark(mark_type)
         old_point = self.point
-        self.point = (getattr(self, direction))()
+        self.point = new_point
         if self.point.top_line != old_point.top_line:
             self._redraw()
         else:
             self._redraw_lines(self.mark_type.lines_affected(
                 self.mark, old_point, self.point))
+
+    def _select(self, direction: DirectionStr,
+                mark_type: Type[Region]) -> None:
+        self._move_to((getattr(self, direction))(), mark_type)
 
     def move(self, direction: DirectionStr) -> None:
         self._select(direction, self.mode_types[self.mode])
