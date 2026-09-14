@@ -522,13 +522,17 @@ class GrabHandler(Handler):
             forward, query = self._pending_search
             if key_event.key == 'ESCAPE':
                 self._pending_search = None
+                self._clear_search_prompt()
                 self._update()
             elif key_event.key == 'ENTER':
                 self._commit_search()
             elif key_event.key == 'BACKSPACE':
                 self._pending_search = (forward, query[:-1]) if query else None
-                (self._update_search_prompt() if self._pending_search
-                 else self._update())
+                if self._pending_search:
+                    self._update_search_prompt()
+                else:
+                    self._clear_search_prompt()
+                    self._update()
             elif key_event.text:
                 self._pending_search = (forward, query + key_event.text)
                 self._update_search_prompt()
@@ -816,47 +820,82 @@ class GrabHandler(Handler):
         extra_skip = 1 if (till and same) else 0
         self._do_find(char, forward if same else not forward, till, extra_skip)
 
+    @staticmethod
+    def _compile_search_query(query: str) -> 're.Pattern':
+        try:
+            return re.compile(query)
+        except re.error:
+            return re.compile(re.escape(query))
+
+    @staticmethod
+    def _rfind_regex(pattern: 're.Pattern', line: str, end: int) -> int:
+        last = -1
+        for m in pattern.finditer(line):
+            if m.start() >= end:
+                break
+            last = m.start()
+        return last
+
     def _search_position(self, forward: bool, query: str) -> Optional[Position]:
+        pattern = self._compile_search_query(query)
         n = len(self.lines)
         cur_line_no = self.point.line
         cur_line = unstyled(self.lines[cur_line_no - 1])
         col = truncate_point_for_length(cur_line, self.point.x)
         if forward:
-            idx = cur_line.find(query, col + 1)
-            if idx != -1:
-                return self._position_for_line(cur_line_no, idx)
+            m = pattern.search(cur_line, col + 1)
+            if m is not None:
+                return self._position_for_line(cur_line_no, m.start())
             for offset in range(1, n):
                 line_no = (cur_line_no - 1 + offset) % n + 1
                 line = unstyled(self.lines[line_no - 1])
-                idx = line.find(query)
-                if idx != -1:
-                    return self._position_for_line(line_no, idx)
-            idx = cur_line.find(query)
+                m = pattern.search(line)
+                if m is not None:
+                    return self._position_for_line(line_no, m.start())
+            m = pattern.search(cur_line)
+            idx = m.start() if m is not None else -1
             return (self._position_for_line(cur_line_no, idx)
                     if idx not in (-1, col) else None)
         else:
-            idx = cur_line.rfind(query, 0, col) if col > 0 else -1
+            idx = self._rfind_regex(pattern, cur_line, col) if col > 0 else -1
             if idx != -1:
                 return self._position_for_line(cur_line_no, idx)
             for offset in range(1, n):
                 line_no = (cur_line_no - 1 - offset) % n + 1
                 line = unstyled(self.lines[line_no - 1])
-                idx = line.rfind(query)
+                idx = self._rfind_regex(pattern, line, len(line) + 1)
                 if idx != -1:
                     return self._position_for_line(line_no, idx)
-            idx = cur_line.rfind(query)
+            idx = self._rfind_regex(pattern, cur_line, len(cur_line) + 1)
             return (self._position_for_line(cur_line_no, idx)
                     if idx not in (-1, col) else None)
 
     def start_search(self, direction: str) -> None:
         self._pending_search = (direction == 'forward', '')
+        self._update_search_prompt()
+
+    def _search_prompt_row(self) -> ScreenLine:
+        return self.screen_size.rows - 1
 
     def _update_search_prompt(self) -> None:
         if self._pending_search is None:
             return
         forward, query = self._pending_search
         prefix = '/' if forward else '?'
-        self.cmd.set_window_title('Grab – {}{}'.format(prefix, query))
+        text = '{}{}'.format(prefix, query)
+        y = self._search_prompt_row()
+        self.cmd.set_cursor_position(0, y)
+        self.print('\x1b[m{}'.format(text), end='\x1b[m\x1b[K')
+        self.cmd.set_cursor_position(wcswidth(text), y)
+        self.cmd.set_window_title('Grab – {}'.format(text))
+
+    def _clear_search_prompt(self) -> None:
+        abs_line = self.point.top_line + self._search_prompt_row()
+        if abs_line <= len(self.lines):
+            self._draw_line(abs_line)
+        else:
+            self.cmd.set_cursor_position(0, self._search_prompt_row())
+            self.print('\x1b[m', end='\x1b[K')
 
     def _do_search(self, forward: bool, query: str) -> None:
         pos = self._search_position(forward, query)
@@ -868,6 +907,7 @@ class GrabHandler(Handler):
     def _commit_search(self) -> None:
         forward, query = self._pending_search
         self._pending_search = None
+        self._clear_search_prompt()
         if query:
             self._last_search = (forward, query)
             self._do_search(forward, query)
